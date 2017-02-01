@@ -1,0 +1,17 @@
+[package]
+name = "torrent"
+version = "0.0.0"
+authors = ["Your Name <you@example.com>"]
+
+[features]
+default = []
+verbose = []
+debug = []
+  
+[dependencies]
+bip_bencode = "0.2.0"
+hyper = "0.9"
+sha1 = "*"
+
+[dependencies.url]
+git = "https://github.com/servo/rust-url"
