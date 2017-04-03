@@ -20,10 +20,12 @@ extern crate sha1;
 
 use bip_bencode::{Bencode,Dictionary};
 
+// constants
 const HOST : &'static str = "127.0.0.1";
 const PORT : u16 = 6882;
-const MAX_PEERS : usize = 10;
 const PEER_ID : [u8 ; 20] = [0 ; 20]; // TODO use a real peer id
+const MAX_PEERS : usize = 10;
+const MAX_BLOCK : usize = 2^14;       // maximum block size
 
 enum event {
   started,
@@ -68,7 +70,7 @@ struct peer<'a> {
   
   host: net::Ipv4Addr,
   port: u16,
-  tlc: Option<time::Instant>, // time of last contact
+  tlc: Option<time::Instant>, // time of last contact, none for no response yet
   
   choked: bool,       // if the peer is choked by us
   interesting: bool,  // if the peer is interesting to us
@@ -77,7 +79,10 @@ struct peer<'a> {
   interested: bool,   // if the peer is interested in us
 
   // TODO: this maybe could be a bit smaller... use a bitfield perhaps?
-  pieces: Vec<(Option<bool>, &'a [u8; 20])>
+  pieces: Vec<(Option<bool>, &'a [u8; 20])>,
+  // list of pieces "in transit" - requested but not (yet) received
+  // left is piece index, right is the last block we've requested
+  transit: Vec<(u32, usize)>
 }
 
 /* torrent files have two modes, single file and multiple file, in the single file
@@ -191,59 +196,45 @@ impl<T> torrent<T> {
     })
   }
 
-  // transforms a piece index into a list of files that the piece spans over
-  // returns vector of (offset, length, path), the idea being to write a piece at index i
-  // to disk, you call this function and get a vector {(o0, l0, p0), (o1, l1, p1), ...},
-  // and then write the first l0 bytes of the piece to p0 at offset o0, and then l1 bytes
-  // of the piece at offset l0 to p1 at offset o1 - also works for reading
-  // ---
-  // takes: offset, length into piece table, returns: offset of first file, index of first
-  // file in path directory table, number of files to write to, and length of write to last
-  // file in path directory table
+  // transforms an offset into the piece table and a length into a list of files
+  // that the segment spans over, returns: offset of first file, index of first
+  // file in path directory table, number of files to write to, and length of
+  // write to last file in path directory table
   // so that's: offset, index, # of files, length
-  fn file(&self, o : u64, l : u64) -> (u64, u64, u64, u64) {
-    match self.info.path {
-      path::file(l) => panic!("Error: called file() on file\n"), //return self.root.push(0, l, self.info.name),
-      path::directory(ref ds) => {
-        let mut offset = 0;
-        let mut index = 0; // file index
-        let mut p = 0; // sum of all file lengths up to this point
+  fn file(ds : &Vec<(u64, PathBuf)>, o : u64, l : u64) -> (u64, u64, u64, u64) {
+    let mut offset = 0;
+    let mut index = 0; // file index
+    let mut p = 0; // sum of all file lengths up to this point
 
-        while o > p + ds[index].0 {
-          p += ds[index].0;
-          index += 1;
-        };
-
-        offset = o - p;
-
-        // at this point, index is the largest file whose start in the piece index table is smaller than our offset
-
-        let mut n = 0;
-        let mut q = p;
-//        print!("asdf {} {} {} {} {}\n", o + l, q, p, index, ds[index].0);
-
-        while (index + n < ds.len() - 1) && (o + l > q + ds[index + n].0) {
-//          print!("loop {} {}\n", o + l, q);
-          q += ds[index + n].0;
-          n += 1;
-        }
-
-        // at this point, index is the smallest file whose end in the piece index table is larger than our offset + length
-
-        // p + ds[index] should be the end of the smallest file whose end in the piece table index is larger than our offset + length (the file that our block ends in)
-        let length = if n > 0 {
-          o + l - q
-        } else {
-          0
-        };
-
-        return (offset, index as u64, n as u64, length);
-      }
+    while o > p + ds[index].0 {
+      p += ds[index].0;
+      index += 1;
     };
-  return (0,0,0,0);
+
+    offset = o - p;
+
+    // at this point, index is the largest file whose start in the piece index table is smaller than our offset
+
+    let mut n = 0;
+    let mut q = p;
+
+    while (index + n < ds.len() - 1) && (o + l > q + ds[index + n].0) {
+      q += ds[index + n].0;
+      n += 1;
+    }
+
+    // at this point, index is the smallest file whose end in the piece index table is larger than our offset + length
+
+    // p + ds[index] should be the end of the smallest file whose end in the piece table index is larger than our offset + length (the file that our block ends in)
+    let length = if n > 0 {
+      o + l - q
+    } else {
+      0
+    };
+
+    return (offset, index as u64, n as u64, length);
   }
 
-  // FIXME: no directory support (need file <-> hash mapping?)
   // FIXME: why is this so SLOW?!?!? maybe it needs to have a larger buffer...
   // should either: succeed, return IO exception, complain about file length mismatch
   // note: consumes self!
@@ -255,12 +246,21 @@ impl<T> torrent<T> {
       path::file(length) => {
         let mut p = PathBuf::from(self.root.clone());
         p.push(self.info.name.clone());
-        let mut h = try!(File::open(p));
-        assert!(length == try!(h.metadata()).len());  // TODO: find nicer way to enforce this
-
-        for i in 0..self.info.pieces.len() {
-          try!(self.read_piece(i as u64, &mut b));
-          pieces.push((self.check_piece(i as u64, &b), self.info.pieces[i].1));
+        match File::open(p) {
+          Ok(h) => {
+            assert!(length == try!(h.metadata()).len());  // TODO: find nicer way to enforce this
+            
+            for i in 0..self.info.pieces.len() {
+              try!(self.read_piece(i as u64, &mut b));
+              pieces.push((self.check_piece(i as u64, &b), self.info.pieces[i].1));
+            };
+          },
+          Err(e) => match e.kind() {
+            io::ErrorKind::NotFound => for i in 0..self.info.pieces.len() {
+              pieces.push((false, self.info.pieces[i].1));
+            },
+            _ => return (Err(e))
+          }
         };
       },
       path::directory(_) => {
@@ -286,7 +286,7 @@ impl<T> torrent<T> {
 
   // should either: set v to the correct piece, and set its length to either piece_length
   // or length - (<number of pieces> * <piece_length>), or return an IO error
-  // NO file length checking or any other sanity checking!
+  // NO file existence or length checking or any other sanity checking!
   fn read_piece(&self, i : u64, mut v : &mut Vec<u8>) -> Result<(), io::Error> {
     match self.info.path {
       path::file(length) => {
@@ -297,7 +297,7 @@ impl<T> torrent<T> {
         
         // last piece is a special case as it is smaller than piece length
         if i == (self.info.pieces.len() - 1) as u64 {
-          v.truncate((length - i * self.info.length as u64) as usize);
+          v.resize((length - i * self.info.length as u64) as usize, 0);
         } else if v.len() != self.info.length as usize {
           v.resize(self.info.length as usize, 0);
         }
@@ -324,7 +324,7 @@ impl<T> torrent<T> {
           v.resize(s as usize, 0);
         };
         
-        let (o, ix, n, l) = self.file(i * self.info.length as u64, s as u64);
+        let (o, ix, n, l) = torrent::<T>::file(&ds, i * self.info.length as u64, s as u64);
 
         let r = {
           let mut p = PathBuf::from(self.root.clone());
@@ -342,18 +342,14 @@ impl<T> torrent<T> {
         // piece size, then we should only read s number of bytes, otherwise read
         // to the end of the file
         let mut br : usize = cmp::min(s as usize, (ds[ix as usize].0 - o) as usize);
-        //print!("br initial value: {}\n", br);
         try!(h.read_exact(&mut v[0..br as usize]));
         
-    //    print!("In read_piece path::directory block, past first read\n");
-
         //assert!(r as u64 == ds[ix as usize].0 - o);
 
         if n > 1 {
           for ox in ix+1..ix+n-1 {
             let mut p = r.clone();
             p.push(&ds[ox as usize].1);
-            //    print!("In read_piece path::directory block, in n>0 block, n={}\n, in loop, ox={}, path={}", n, ox, p);
             let mut h = try!(File::open(&p));
             try!(h.read_exact(&mut v[br..br+ds[ox as usize].0 as usize]));
             br += ds[ox as usize].0 as usize;
@@ -361,15 +357,13 @@ impl<T> torrent<T> {
         };
           
         if n > 0 {
-          //print!("In n>0 block\n");
           let mut p = r.clone();
           p.push(&ds[(ix+n) as usize].1);
           let mut h = try!(File::open(&p));
           try!(h.read_exact(&mut v[br..br+l as usize]));
         };
 
-        //print!("In read, i={}, br={}, l={}, s={}, br+l=s = {}\n", i, br, l, s, (br+l as usize)==s as usize);
-        assert!(br+l as usize  == s as usize);
+        assert!(br+l as usize == s as usize);
       }
     };
 
@@ -499,7 +493,8 @@ impl<'a> peer<'a> {
       choking: true,
       interested: false,
 
-      pieces: ps
+      pieces: ps,
+      transit: Vec::new()
     };
   }
 
@@ -511,7 +506,7 @@ impl<'a> peer<'a> {
       2 => message::interested,
       3 => message::uninterested,
       4 => message::have(from_big_endian_u32(&p[0..4])),
-      5 => message::bitfield(&p[1..]),
+      5 => message::bitfield(&p[0..]),
       6 => message::request(from_big_endian_u32(&p[0..4]), from_big_endian_u32(&p[4..8]), from_big_endian_u32(&p[8..12])),
       7 => message::piece(from_big_endian_u32(&p[0..4]), from_big_endian_u32(&p[4..8]), &p[9..]),
       8 => message::cancel(from_big_endian_u32(&p[0..4]), from_big_endian_u32(&p[4..8]), from_big_endian_u32(&p[8..12])),
@@ -568,9 +563,28 @@ impl<'a> peer<'a> {
     s.write(&to_big_endian_u32(i));
   }
 
-//  fn bitfield(&self, s : &mut TcpStream) {
-//    let 
-//  }
+  fn bitfield(&self, s : &mut TcpStream) {
+    let mut f = vec![0 ; f64::ceil(self.pieces.len() as f64 / 8 as f64) as usize];
+    
+    let mut o = 0;
+    let mut s = 0;
+
+    while o < f.len() {
+      while s < 8 {
+        if o * 8 + s > self.torrent.info.pieces.len() {
+          break;
+        };
+
+        if self.torrent.info.pieces[o * 8 + s].0 {
+          f[o] |= 1 << (7 - s);
+        };
+        s += 1;
+      };
+
+      s = 0;
+      o += 1;
+    };
+  }
 }
 
 fn escape_char(c : &u8) -> String {
@@ -634,22 +648,21 @@ fn main() {
     }
   };
 
-  for i in 0..t.info.pieces.len() {
-    print!("Piece: {}, have: {}, file: {:?}\n", i, t.info.pieces[i].0, t.file((t.info.length * i as u32) as u64, t.info.length as u64));
+  // completed
+  let mut d : bool = true;
+  for p in &t.info.pieces {
+    d &= p.0;
   };
-  
-  print!("t.info.path: {:?}\n", t.info.path);
-  print!("file: {:?}\n", t.file(0, 12132352));
   
   let c = hyper::Client::new();
   let r = match t.announce(c) {
     None => panic!("Error: Invalid response.\n"),
     Some(r) => r
   };
-  let mut ps = Vec::new();
+  let mut ps = Vec::new();  // peers
   // FIXME: there has to be some way to keep this in ps?!?!
-  // hack to get around borrow checker not liking vectors of tuples with mutable parts
-  let mut ss = Vec::new();
+  // minor hack to get around borrow checker not liking vectors of tuples with mutable parts
+  let mut ss = Vec::new();  // peer sockets
   for a in r.peers.iter() {
     let mut s = match TcpStream::connect((a.0, a.1)) {
       Err(e) => {
@@ -661,18 +674,19 @@ fn main() {
     
     ps.push(peer::new(a.0, a.1, &t));
     ss.push(s);
-  }
+  };
 
   let mut b = vec![0; 68];
   let mut gs = Vec::new();  // garbage peers, to close their connections later
 
   for i in 0..ps.len() {
     print!("In handshake, peer: {}:{}\n", &ps[i].host, ps[i].port);
-    // TODO: remove peers who fail handshakes
     if !ps[i].handshake(&mut ss[i], &mut b) {
       print!("Warning: Handshake failure for peer {}:{}, received {:?}\n", ps[i].host, ps[i].port, b);
       gs.push(i);
     };
+
+    ps[i].bitfield(&mut ss[i]);
   };
 
   let mut sb = [0 ; 4];     // message size buffer (4 byte unsigned big endian integer)
@@ -680,31 +694,33 @@ fn main() {
   let mut pb = b;           // message payload buffer
   let mut rb = Vec::new();  // read buffer, for responding to block request messages
                             // we can't use pb for this because our parsed message might point to it
+  let mut dl = Vec::new();  // list of pieces to get
 
+  for p in 0..t.info.pieces.len() {
+    if !&t.info.pieces[p].0 {
+      dl.push(p);
+    };
+  };
+  
   let l = match TcpListener::bind((HOST, PORT)) {
     Ok(l) => l,
     Err(e) => panic!("Error: Could not listen on address {}:{}, error: {}\n", HOST, PORT, e)
   };
+  l.set_nonblocking(true);
 
   // TODO: a few of these blocks could probably be moved into their own functions
   loop {
     // collect garbage peers
-    // reverse sort so that we remove indices from the top down, so that we don't
+    // reverse sort so that we remove indices from the top down, so as to not
     // shift indices of elements that we haven't removed yet
     gs.sort_by(|b, a| a.cmp(b));
-    for g in 0..gs.len() {
-      ss[gs[g]].shutdown(net::Shutdown::Both);
-      ss.remove(gs[g]);
-      ps.remove(gs[g]);
+    for g in gs {
+      ss[g].shutdown(net::Shutdown::Both);
+      ss.remove(g);
+      ps.remove(g);
     };
     gs.clear();
 
-    for ref p in &ps {
-      print!("In loop after garbage peer collection, peer: {}:{}\n", p.host, p.port);
-    };
-//    print!("Right before incoming loop, l.incoming.len()={}\n", l.incoming().iter().len());
-    // add new incoming connections to peers
-    /*
     for c in l.incoming() {
       match c {
         Ok(mut c) => match c.peer_addr() {
@@ -721,8 +737,8 @@ fn main() {
                 print!("Warning: Handshake failure for peer {}:{}, received {:?}\n", p.host, p.port, pb);
               }
             },
-            net::SocketAddr::V6(_) => {
-              print!("Info: Received IPv6 Address {}\n", a);
+            net::SocketAddr::V6(a) => {
+              print!("Info: Received IPv6 Address {}, discarding\n", a);
               continue;
             }
           },
@@ -730,14 +746,12 @@ fn main() {
             print!("Warning: Socket address lookup failed, error={}\n", e);
           }
         },
-        Err(e) => {
-          print!("Warning: Incoming connection failed, error={}\n", e);
-        }
-      }
-    }*/
-    print!("Right before networking loop\n");
+        Err(e) => () // no new peers
+      };
+    };
+
     for i in 0..cmp::min(ps.len(), MAX_PEERS) {
-      print!("In networking loop for peer {}:{}\n", &ps[i].port, ps[i].port);
+      print!("In networking loop for peer {}:{}\n", &ps[i].host, ps[i].port);
       // read message size
       match ss[i].read_exact(&mut sb).err() {
         Some(e) => {
@@ -786,6 +800,11 @@ fn main() {
 
       print!("Info: Message: {:?} for peer: {}:{}\n", m, ps[i].host, ps[i].port);
 
+      /* my interpretation of the bittorrent protocol:
+         we handshake, then, we send a bitfield to our peer
+         if we have pieces to download, we request one from each peer
+         in a round-robin fashion */
+
       // TODO: move this to its own function, peer::interpret() maybe?
       match m {
         message::unchoke => {
@@ -811,14 +830,31 @@ fn main() {
             };
           };
         },
+        message::have(x) => {
+          assert!((x as usize) < ps[i].pieces.len());
+          
+        },
         message::bitfield(f) => {
-          for o in 0..f.len() {
-            for n in 0..8 {
-              // TODO: proper error handling
-              assert!(o + (7 - n) <= ps[i].pieces.len());
-              // the MSB of the first byte, f[0] & (1 << 7), corresponds to piece 0
-              ps[i].pieces[o + (7 - n)].0 = Some(1 == f[o] & (1 << (7 - n)));
+          let mut o = 0;
+          let mut s = 0;
+
+          while o < f.len() {
+            while s < 8 {
+              if o * 8 + s > ps[i].pieces.len() {
+                break;
+              };
+
+              ps[i].pieces[o * 8 + s].0 = Some(0 < f[o] & (1 << (7 - s)));
+              s += 1;
             };
+            
+            while s < 8 {
+              assert!(0 == f[o] & (1 << (7 - s)));
+              s += 1;
+            };
+
+            s = 0;
+            o += 1;
           };
         },
         message::request(x, o, l) => {  // x for piece index, o for offset, l for length
@@ -826,18 +862,30 @@ fn main() {
           // TODO: proper error handling
           assert!(x < t.info.pieces.len() as u32);
           assert!(o + l <= t.info.length);
-          t.read_piece(x as u64, &mut rb);
-
-          let mut rv_mid = &mut rb.split_at(o as usize);
-          let rv = rv_mid.1.split_at(l as usize).0;
-          
+          match t.read_piece(x as u64, &mut rb) {
+            Ok(()) => (),
+            Err(e) => {
+              print!("Error: {}\n", e);
+            }
+          }
+ 
           ss[i].write(&to_big_endian_u32(1 + 4 + 4 + l)); // message + index + offset + block length
           ss[i].write(&[7]);
           ss[i].write(&to_big_endian_u32(x));
           ss[i].write(&to_big_endian_u32(o));
-          ss[i].write(&rv);
+          ss[i].write(&rb[(o as usize)..((o+l) as usize)]);
         }
         _ => print!("Warning: Unimplemented message: message={:?}\n", m)
+      };
+
+      // if we do not have all pieces, then here we request a block
+      if !d {
+        match dl.pop() {
+          None => (),
+          Some(p) => {
+//            ps[i].transit.push(p);
+          }
+        }
       };
 
       ss[i].flush();
